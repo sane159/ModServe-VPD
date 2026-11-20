@@ -61,6 +61,7 @@ def worker(rank: int, num_requests: int, hit_rate: float, max_new_tokens: int, m
     transport = VPDTransport(data_backend="nccl")
 
     processor = AutoProcessor.from_pretrained(MODEL_ID)
+    processor.image_processor.do_image_splitting = False
     model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, dtype=dtype).to(device).eval()
     eos_id = processor.tokenizer.eos_token_id
 
