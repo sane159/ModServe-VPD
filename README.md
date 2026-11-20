@@ -1,236 +1,93 @@
-# ModServe
+# ModServe-VPD: 多模态三阶段分离式推理服务
 
-[![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/release/python-3100/)
-[![vLLM Backend](https://img.shields.io/badge/backend-vLLM-orange.svg)](https://github.com/vllm-project/vllm)
+cd /root/lanyun-tmp/mini-sglang/ [Azure/ModServe](https://github.com/Azure/ModServe)（SoCC 2025）扩展，使用 PyTorch / Transformers 为 [SmolVLM-256M-Instruct](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct) 实现**视觉编码（V）+ Prefill（P）+ Decode（D）三阶段分离式推理后端**，支持可配置设备池、Gloo/NCCL 双通道交接、原子预留路由背压、SSE 流式输出与 BF16 精确对齐的视觉特征 LRU 缓存。
 
-Serving infrastructure and production trace-replay benchmarks for large multimodal models
-(LMMs), from the paper [*ModServe: Modality- and Stage-Aware Resource
-Disaggregation for Scalable Multimodal Model Serving*](https://dl.acm.org/doi/10.1145/3698038.3698540)
-(SoCC 2025).
+## 核心架构
 
-It compares two serving architectures under realistic request traces:
-
-| Architecture | Description |
-|---|---|
-| **Monolith** | The full vision-language model served by a single vLLM instance. |
-| **ModServe** | *Disaggregated* serving: vision encoders run on separate "image nodes" and stream encoded image tensors over NCCL to the "text node" running the language model. |
-
-A **cluster manager** fronts both architectures with configurable routing
-(least-loaded / round-robin); a **trace client** replays timestamped request
-traces from the [Azure LMM Inference Trace](https://github.com/Azure/AzurePublicDataset/blob/master/AzureLMMInferenceDataset2025.md).
-
-## Architecture Overview
-
-```
-                          ┌──────────────────────────────────────────┐
-                          │ Cluster Manager (Flask)                  │
- ┌───────────────┐  HTTP  │ - least_loaded / round_robin routing     │
- │ Trace Client  │───────►│ - autoscaling (optional)                 │
- └───────────────┘        └──┬──────────────────────────────┬────────┘
-                        (Monolith)                      (ModServe)
-                             │                              │
-                             │                              │
-                             │                              │
-                  ┌──────────▼─────────┐          ┌─────────▼────────┐   NCCL   ┌──────────────┐
-                  │ Text Node (vLLM)   │          │ Image Node(s)    │─────────►│ Text Node    │
-                  │ full VLM inline    │          │ vision encoder   │          │ (LLM only)   │
-                  └────────────────────┘          └──────────────────┘          └──────────────┘
+```text
+Client (HTTP / SSE)
+   │
+   ▼
+Gateway & VPDRouter (FastAPI + 原子预留槽位 + FIFO 队列 + HTTP 429 背压 + Token 重排)
+   │  Gloo 控制面 (请求任务)
+   ▼
+Vision Pool (1V) ──[NCCL/Gloo 视觉特征 + Gloo ACK]──► Prefill Pool (1P)
+  · 内容寻址 SHA256 LRU (按字节预算淘汰)                · 注入视觉特征跑 Prefill
+  · 仅保留 vision_model + connector (-62.7% 显存)      · 立即回传首 Token (压低 TTFT)
+  · 请求形状隔离 + 非零占位补齐 (0.0 BF16 漂移)         · 打包 30 层连续 KV
+                                                          │
+                                       [NCCL/Gloo 打包 KV + Gloo ACK]
+                                                          ▼
+                                                 Decode Pool (2D: D0 / D1)
+                                                  · 双副本并行增量解码
+                                                  · 仅保留 text_model + lm_head (-37.3% 显存)
+                                                  · 逐 Token 流式回传网关
 ```
 
-## Supported Models
+## 核心特性
 
-| Model | Architecture | Config key |
-|---|---|---|
-| [Llama 3.2 11B Vision Instruct](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct) | MLLAMA (cross-attention) | `meta-llama/Llama-3.2-11B-Vision-Instruct` |
-| [InternVL2.5-26B](https://huggingface.co/OpenGVLab/InternVL2_5-26B) | INTERNVL (decoder-only) | `OpenGVLab/InternVL2_5-26B` |
+- **三阶段拆分与权重裁剪（`src/lmm_serving/vpd/model_stages.py`）**：将 V / P / D 拆为独立阶段并按需裁剪冗余子模块权重（`V` 显存 `496.8MB → 185.5MB`，`P/D` 显存 `496.8MB → 311.4MB`）；将 30 层 `(K, V)` 打包为单个连续张量 `[L, 2, B, H, S, D]`，消除逐层通信开销。
+- **双通道通信与安全交接（`src/lmm_serving/vpd/transport.py`）**：控制面走 Gloo 传递元数据、张量形状与校验 ACK，数据面支持 `gloo`（单卡/共享卡调试）与 `nccl`（多卡 P2P 直传）一键切换；接收端校验并接管显存后发送端再释放引用。
+- **原子预留路由与异常整组回收（`src/lmm_serving/vpd/scheduler.py`, `cluster.py`, `server.py`）**：入队时原子预留 `(V, P, D)` 槽位避免跨阶段死锁，V/P 在收到交接 ACK 后立即释放、D 在生成结束后释放，实现跨请求阶段重叠与双 Decode 副本并行；支持 FIFO 等待队列、接纳上限背压（HTTP 429）、Token 序号重排 SSE 输出，以及 worker 异常时即时唤醒在途请求并整组回收进程。
+- **视觉特征 LRU 与 BF16 数值修复（`src/lmm_serving/vpd/vision_cache.py`）**：实现基于内容 SHA256 寻址与字节预算淘汰的视觉特征 LRU；定位并修复多图部分命中改变 encoder batch 形状导致的 BF16 漂移（`1,006,693 / 1,253,376` 元素漂移、最大误差 `1.0` → 按请求形状隔离键 + 非零占位补齐原满 batch 形状后误差归零至 `0.0`，与单模型逐 Token 100% 一致）。
 
-## Hardware Requirements
+## 实测结果（2×A100-PCIE-40GB, PIX）
 
-- **GPU**: NVIDIA A100 (40 GB or 80 GB) or equivalent; minimum 4 GPUs for the
-  default `local.yaml` topologies.
-- **CUDA**: 12.4+ (driver ≥ 550).
-- **RAM**: ≥ 64 GB recommended (model weights + KV cache).
-- **Disk**: ~50 GB for model weights + ~6.5 GB for ShareGPT-4o images.
-- **Multi-box** (optional): InfiniBand for cross-node NCCL tensor transfer.
+cd /root/lanyun-tmp/mini-sglang`SmolVLM-256M-Instruct` BF16、双图（34 tiles）/ 8 输出 Token、客户端并发 1、90% 图片命中率混合复用负载。
 
-## Installation
+| 指标 | 无缓存基线 | 启用视觉 LRU 缓存 | 收益 / 校验 |
+| :--- | :--- | :--- | :--- |
+| **TTFT P50（真 NCCL 通道）** | `104.5 ms` | **`73.1 ms`** | **降低 30.1%** |
+| **30 层打包 KV 交接 + ACK P50** | `49.94 MB` | `6.31 ms` | 有效带宽 `7.73 GB/s` |
+| **与单模型逐 Token 对齐** | 40 / 40 | 40 / 40 | **0 误差（BF16 漂移 0.0）** |
+| **按阶段权重显存裁剪** | `496.8 MB / 进程` | `V: 185.5 MB` / `P,D: 311.4 MB` | **V -62.7% / P,D -37.3%** |
 
-### Option A: Pixi (recommended)
+## 目录结构
 
-[Pixi](https://pixi.sh) manages the full toolchain — CUDA toolkit, Python 3.10,
-all dependencies, the patched vLLM backend, and flash-attn — from `pixi.toml`.
+```text
+src/lmm_serving/vpd/
+ model_stages.py   # SmolVLM 三阶段前向、30 层 KV 打包/解包、按阶段权重裁剪
+ transport.py      # Gloo 控制面/ACK + 可插拔 Gloo/NCCL 数据面
+ scheduler.py      # 可配置设备池、原子预留路由、FIFO 等待队列与背压
+ cluster.py        # 多进程池管理、可配置 device_map、Token 重排与异常整组回收
+ server.py         # FastAPI + SSE 流式服务入口 (/v1/generate, /health)
+ vision_cache.py   # SHA256 字节预算 LRU、BF16 形状隔离与非零占位补齐
+
+scripts/
+ verify_smolvlm_vpd_local.py      # 单卡三阶段前向拆分与单模型逐 Token 对齐
+ verify_vpd_multiprocess.py       # 1V+1P+2D 多进程 Gloo/NCCL 交接验证
+ verify_vpd_service.py            # 并发重叠、双 D 并行、Token 重排、背压与异常回收验证
+ verify_vision_cache_bf16.py      # LRU 字节淘汰 + Naive BF16 漂移复现与 0.0 修复验证
+ bench_vpd_cache.py               # 1V+1P+2D 可配置 device_map 缓存压测
+ bench_2gpu_nccl.py               # 双卡真 NCCL 分离部署压测
+ bench_2gpu_nccl_gpu_preproc.py   # 双卡真 NCCL + GPU 34-tile 切图压测
+```
+
+## 快速开始
 
 ```bash
-# 1. Install Pixi (if not already installed)
-curl -fsSL https://pixi.sh/install.sh | bash
+conda create -n modserve-vpd python=3.11 -y
+conda activate modserve-vpd
+pip install torch torchvision --index-url [https://download.pytorch.org/whl/cu124](https://download.pytorch.org/whl/cu124)
+pip install "transformers>=4.49.0" accelerate pillow fastapi uvicorn sse-starlette pyyaml pytest requests pandas
+pip install -e . --no-deps
 
-# 2. Build everything: CUDA toolkit + deps + editable package + patched vLLM + flash-attn
-pixi run setup
+# 1. 单卡三阶段逐 Token 对齐验证
+python scripts/verify_smolvlm_vpd_local.py
 
-# Alternatively, use the full provisioning script (also installs Pixi if needed):
-bash utils/setup_repo.sh
+# 2. 1V+1P+2D 多进程交接、调度背压与异常回收验证
+HF_HUB_OFFLINE=1 python scripts/verify_vpd_service.py
+
+# 3. 视觉 LRU 与 BF16 漂移修复验证
+HF_HUB_OFFLINE=1 python scripts/verify_vision_cache_bf16.py
+
+# 4. 双卡真 NCCL 分离部署与缓存收益压测（需 >= 2 GPU）
+HF_HUB_OFFLINE=1 python scripts/bench_2gpu_nccl_gpu_preproc.py --num-requests 40 --hit-rate 0.90
+
+# 5. 双卡/四卡 1V+1P+2D 全流程压测（四卡可切 --backend nccl）
+HF_HUB_OFFLINE=1 python scripts/bench_vpd_cache.py --num-requests 40 --hit-rate 0.90 --backend gloo --device-map 0,0,1,1
 ```
 
-### Option B: Conda
+## 致谢
 
-Use a standalone Conda environment if you prefer managing dependencies manually.
-
-```bash
-# 1. Create and activate the environment
-conda create -n modserve python=3.10 -y
-conda activate modserve
-
-# 2. Install PyTorch with CUDA 12.4 support
-pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
-    --index-url https://download.pytorch.org/whl/cu124
-
-# 3. Install project dependencies
-pip install -r requirements.txt
-pip install huggingface-hub==0.27.1 openai
-
-# 4. Install the package in editable mode
-pip install -e .
-
-# 5. Build the patched vLLM backend (requires CUDA toolkit / nvcc)
-bash llm-backend/build_vllm.sh
-
-# 6. Install flash-attn (optional but recommended; requires nvcc)
-pip install --no-build-isolation flash-attn==2.7.4.post1
-```
-
-> **Note:** Steps 5–6 require a working `nvcc` (CUDA 12.4 toolkit). If you
-> installed CUDA via your package manager, ensure `nvcc --version` works before
-> running them.
-
-## Quickstart
-
-After installing with either option above:
-
-```bash
-# 1. Configure paths and model
-#    Edit IMAGE_DIR, HF_HOME, MODEL, and cluster settings as needed.
-#    Defaults assume ${HOME}/hf_cache for model weights and images.
-$EDITOR src/lmm_serving/config/config.yaml
-
-# 2. Authenticate with Hugging Face (to download model weights)
-huggingface-cli login          # or: export HF_TOKEN=hf_YOUR_TOKEN_HERE
-
-# 3. Stage trace images (downloads ~6.5 GB of ShareGPT-4o images)
-python utils/stage_sharegpt4o_images.py
-
-# 4. Fetch and sample the Azure LMM trace (downloads + samples a 1-hour window)
-python utils/fetch_trace.py
-
-# 5. Create experiment traces at a given scale factor
-#    Higher factor = lighter load (e.g., 2.0 halves the QPS).
-python utils/create_experiment_qps_traces.py \
-    AzureLMMInferenceTrace_img_heavy_1_hour.csv 2.0
-
-# 6. Run an experiment
-python -m lmm_serving.launcher run modserve 2.0   # or: monolith
-```
-
-> **Pixi users:** prefix commands with `pixi run`, e.g., `pixi run python -m lmm_serving.launcher run modserve 2.0`.
-
-### Authentication & Secrets
-
-Model downloads require a Hugging Face token (Llama-3.2-Vision is a **gated** model —
-request access first at its model page).
-
-```bash
-export HF_TOKEN=hf_YOUR_TOKEN_HERE     # or run: huggingface-cli login
-```
-
-### Multi-box Setup
-
-For disaggregated serving across multiple hosts (image nodes on separate boxes):
-
-```bash
-# Bootstrap remote boxes from the primary host
-bash utils/remote_setup.sh <box2_ip> [box3_ip ...]
-```
-
-Then edit the topology file under `configs/modserve/` to describe your cluster
-layout (see [docs/topology.md](docs/topology.md)).
-
-### Validating a Topology
-
-Check your topology file for errors before launching:
-
-```bash
-python -m lmm_serving.launcher validate modserve   # or: monolith
-```
-
-## Project Structure
-
-```
-├── src/lmm_serving/          # Main package
-│   ├── config/               # config.yaml + loader
-│   ├── common/               # Shared: scheduling, autoscaling, text_node, vision_tokens
-│   ├── launcher/             # CLI entry point, topology, process orchestration
-│   ├── modserve/             # Disaggregated serving components
-│   │   └── components/       # cluster_manager, image/text node managers, tensor transfer
-│   ├── monolith/             # Monolithic serving components
-│   │   └── components/       # cluster_manager, text node manager
-│   ├── profiler/             # Latency profiling + RF model fitting
-│   └── experiments/          # Ablation runner + scoring
-├── client/                   # Trace replay client
-├── configs/                  # Topology YAML files (modserve/ and monolith/)
-├── llm-backend/              # Patched vLLM build script + patch file
-├── utils/                    # Setup, trace fetch/staging, cleanup scripts
-├── tests/                    # Unit tests (topology, scheduling, autoscaling, profiler)
-├── notebooks/                # Evaluation notebooks
-├── docs/                     # Detailed documentation
-├── pixi.toml                 # Pixi workspace definition
-├── pyproject.toml            # Python package metadata
-└── requirements.txt          # Pip dependencies
-```
-
-## Running Tests
-
-The test suite validates topology wiring, scheduling logic, autoscaling, and the
-profiler model — no GPUs required:
-
-```bash
-python tests/test_launcher.py      # 39 tests — topology, NCCL wiring, SSH transport
-python tests/test_scheduling.py    #  9 tests — routing, load balancing
-python tests/test_autoscaler.py    # 20 tests — active set, sliding window, autoscaler
-python tests/test_profiler.py      #  2 tests — RF model capacity
-```
-
-## Documentation
-
-| Document | Description |
-|---|---|
-| [docs/configuration.md](docs/configuration.md) | Every `config.yaml` parameter explained |
-| [docs/topology.md](docs/topology.md) | Writing `configs/<setup>/nodes_*.yaml` cluster topologies |
-| [docs/experiments.md](docs/experiments.md) | End-to-end pipeline: profiling → traces → runs → ablation → plots |
-
-## Troubleshooting
-
-| Problem | Solution |
-|---|---|
-| `ModuleNotFoundError: No module named 'vllm'` | Run `bash llm-backend/build_vllm.sh` (Conda) or `pixi run build-vllm` (Pixi). |
-| `ModuleNotFoundError: No module named 'flash_attn'` | Run `pip install --no-build-isolation flash-attn==2.7.4.post1`. Requires `nvcc`. |
-| `huggingface_hub` version conflict | Pin to `0.27.1`: `pip install huggingface-hub==0.27.1`. |
-| NCCL timeout on multi-box | Check `NCCL_SOCKET_IFNAME` matches your network interface; set `NCCL_IB_DISABLE=true` if no InfiniBand. |
-| GPU out of memory | Lower `TEXT_GPU_UTIL` or `TEXT_MAX_MODEL_LEN` in `config.yaml`. |
-| `nvidia-smi` not found | Install the NVIDIA driver (≥ 550 for CUDA 12.4). |
-| Topology validation errors | Run `python -m lmm_serving.launcher validate <setup>` and fix the reported issues. |
-
-## Citation
-
-If you use ModServe in your research, please cite:
-
-```bibtex
-@inproceedings{qiu2025modserve,
-  title     = {{ModServe}: Modality-and Stage-Aware Resource Disaggregation
-               for Scalable Multimodal Model Serving},
-  author    = {Qiu, Haoran and Biswas, Anish and Zhao, Zihan and Mohan, Jayashree
-               and Khare, Alind and Choukse, Esha and Goiri, {\'I}{\~n}igo
-               and Zhang, Zeyu and Shen, Haiying and Bansal, Chetan and others},
-  booktitle = {Proceedings of the 2025 ACM Symposium on Cloud Computing (SoCC 2025)},
-  pages     = {817--830},
-  year      = {2025}
-}
-```
+ [Azure/ModServe](https://github.com/Azure/ModServe) 开源框架扩展开发，原论文发表于 ACM SoCC 2025（*ModServe: Modality- and Stage-Aware Resource Disaggregation for Scalable Multimodal Model Serving*）。
