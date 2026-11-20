@@ -43,12 +43,13 @@ def build_workload(num_requests: int, hit_rate: float = 0.90):
     return requests_data, num_unique
 
 
-def run_benchmark(workload, backend: str, port: int, enable_cache: bool, max_new_tokens: int):
+def run_benchmark(workload, backend: str, port: int, enable_cache: bool, max_new_tokens: int, device_map=None):
     cluster = VPDCluster(
         data_backend=backend,
         master_port=port,
         max_admitted=4,
         enable_vision_cache=enable_cache,
+        device_map=device_map,
     )
     cluster.start()
     ttfts = []
@@ -84,16 +85,18 @@ def main():
     parser.add_argument("--hit-rate", type=float, default=0.90)
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--backend", choices=["gloo", "nccl"], default="gloo")
+    parser.add_argument("--device-map", type=str, default=None)
     args = parser.parse_args()
 
     workload, num_unique = build_workload(args.num_requests, args.hit_rate)
     print(f"Workload: {args.num_requests} reqs (2 imgs/req, {args.max_new_tokens} tokens, {num_unique} unique imgs, target hit~{args.hit_rate*100:.0f}%, backend={args.backend})")
 
     print("\n[1/2] Running baseline (vision cache OFF)...")
-    ttft_off, out_off = run_benchmark(workload, args.backend, 29531, enable_cache=False, max_new_tokens=args.max_new_tokens)
+    dmap = [int(x) for x in args.device_map.split(",")] if args.device_map else None
+    ttft_off, out_off = run_benchmark(workload, args.backend, 29531, enable_cache=False, max_new_tokens=args.max_new_tokens, device_map=dmap)
 
     print("[2/2] Running cached   (vision cache ON )...")
-    ttft_on, out_on = run_benchmark(workload, args.backend, 29532, enable_cache=True, max_new_tokens=args.max_new_tokens)
+    ttft_on, out_on = run_benchmark(workload, args.backend, 29532, enable_cache=True, max_new_tokens=args.max_new_tokens, device_map=dmap)
 
     # Strict token-for-token parity check across every request
     mismatches = sum(1 for a, b in zip(out_off, out_on) if a != b)

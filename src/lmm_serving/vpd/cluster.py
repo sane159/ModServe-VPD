@@ -33,12 +33,13 @@ def _worker_entry(
     event_queue,
     enable_vision_cache: bool = True,
     vision_cache_max_bytes: int = 256 * 1024 * 1024,
+    gpu_id: int = 0,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(master_port)
     os.environ["HF_HUB_OFFLINE"] = "1"
 
-    device = f"cuda:{rank}" if data_backend == "nccl" else "cuda:0"
+    device = f"cuda:{gpu_id}"
     torch.cuda.set_device(device)
     dtype = torch.bfloat16
 
@@ -246,12 +247,17 @@ class VPDCluster:
         max_admitted: int = 4,
         enable_vision_cache: bool = True,
         vision_cache_max_bytes: int = 256 * 1024 * 1024,
+        device_map: Optional[List[int]] = None,
     ):
         self.model_id = model_id
         self.data_backend = data_backend
         self.master_port = master_port
         self.enable_vision_cache = enable_vision_cache
         self.vision_cache_max_bytes = vision_cache_max_bytes
+        if device_map is None:
+            self.device_map = [0, 1, 2, 3] if data_backend == "nccl" else [0, 0, 0, 0]
+        else:
+            self.device_map = list(device_map)
         self.ctx = mp.get_context("spawn")
         self.v_task_queue = self.ctx.Queue()
         self.event_queue = self.ctx.Queue()
@@ -288,6 +294,7 @@ class VPDCluster:
                     self.event_queue,
                     self.enable_vision_cache,
                     self.vision_cache_max_bytes,
+                    self.device_map[rank],
                 ),
             )
             p.start()
